@@ -83,22 +83,6 @@ class Starter : Clunkyard.Robot {
             $climb=if($zone.Shape -eq [Clunkyard.Shape]::Sphere){$this.Angles.ElevationTo($position,$zone.Center)}else{0}
             $this.Drive.Set(0.8,$this.Angles.Clamp($this.Angles.AngleDiff($this.Angles.BearingTo($position,$zone.Center),$me.Heading)/30),$this.Angles.Clamp(($climb-$me.Pitch)/30))
         }
-        # The arena's rate calibration only; safe to delete.
-        $work=$this.Raw.Number('state.calibration.work')
-        if($work -gt 0){$this.Status.Set('WORK',[Starter]::CalibrationWork($work,$this.Clock.Tick))}
-    }
-    # The calibration kernel, xorshift-sqrt v1: work rounds of a 64-bit
-    # xorshift and a square-root sum.
-    static [long] CalibrationWork([int]$work, [int]$tick) {
-        [uint64]$x = [uint64]88172645463325252 -bxor [uint64]$tick
-        [double]$sum = 0
-        for ($i = 0; $i -lt $work; $i++) {
-            $x = $x -bxor ($x -shl 13)
-            $x = $x -bxor ($x -shr 7)
-            $x = $x -bxor ($x -shl 17)
-            $sum += [Math]::Sqrt($x -shr 11)
-        }
-        return ([uint64][Math]::Floor($sum) + ($x -shr 40)) % 1000000
     }
 }
 

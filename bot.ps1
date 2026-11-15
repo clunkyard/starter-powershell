@@ -7,7 +7,8 @@
 # clock: tick seconds remaining_ticks
 # arena: size gravity terrain_kind ground_height(x y)
 # me: health position velocity heading pitch roll angular_velocity
-#   attitude grounded altitude applied
+#   attitude grounded altitude applied hull_mounts to_mount(heading pitch)
+#   from_mount(heading pitch) mount_toward(point)
 # battery: charge capacity regen sustainable_drive compute
 #   drive_cost(fraction)
 # drive: hover_lift
@@ -29,7 +30,8 @@
 # score: me best armour
 # angles: normalize(degrees) angle_diff(target current)
 #   bearing_to(from to) elevation_to(from to) direction(heading pitch)
-#   distance(a b) clamp(value low high)
+#   distance(a b) to_chassis(heading pitch attitude)
+#   from_chassis(heading pitch attitude) clamp(value low high)
 # raw: number(path) text(path) has(path) flag(path) count(path) line()
 # Controls: drive.set(throttle turn pitch_turn)
 #   drive.forces(thrust strafe lift yaw_torque pitch_torque roll_torque brake)
@@ -45,6 +47,8 @@ using namespace Clunkyard
 
 class Starter : Clunkyard.Robot {
     [bool] $Free
+    [int] $Dodges
+    [int] $DodgeEnd
     [double] Steer([double]$towards,[double]$current){return $this.Angles.Clamp($this.Angles.AngleDiff($towards,$current)/45)}
     [void] OnStart(){$this.Free=$this.Match.Is3d -and $this.Arena.Gravity.Z -eq 0}
     [void] OnTurn(){
@@ -55,6 +59,7 @@ class Starter : Clunkyard.Robot {
             $throttle=if($target.Range -gt 350){0.7}elseif($target.Range -lt 200){-0.4}else{0.2}
             $this.Drive.Set($throttle,$this.Steer($target.Bearing,$me.Heading),$this.Steer($target.Elevation,$me.Pitch))
             $scanner.Set($target.Bearing,20,$target.Elevation)
+            # Gun.Lead is the intercept if the target holds course.
             $power=$gun.PowerForFlightTime($target.Range,1);$aim=$gun.Lead($target,$power)
             $heading=if($null -ne $aim){$aim.Heading}else{$target.Bearing}
             $pitch=if($null -ne $aim){$aim.Pitch}else{$target.Elevation}
@@ -72,6 +77,17 @@ class Starter : Clunkyard.Robot {
             $this.Drive.Set(0.5,0.33,$this.Steer(0,$me.Pitch))
             $pitch=if($this.Free){([Math]::Floor($this.Clock.Tick/10)%3-1)*35}else{0}
             $scanner.Set($this.Angles.Normalize($scanner.Last.Heading+36),40,$pitch);$this.Status.Set('SEARCH',$null)
+        }
+        # A simple dodge: vary it, or predict the shooter.
+        $tick=$this.Clock.Tick;$heard=$false
+        foreach($c in $this.Sensors.Cues){if($c.Source -eq [Clunkyard.Source]::Muzzle){$heard=$true}}
+        if($tick -ge $this.DodgeEnd -and $heard){$this.Dodges++;$this.DodgeEnd=$tick+10}
+        if($tick -lt $this.DodgeEnd){
+            # Off the line of fire: left, then right next time (turn is positive left, strafe right).
+            $left=$this.Dodges%2 -eq 1
+            if($this.Match.Control -eq [Clunkyard.Control]::Forces){$this.Drive.Set(0.5,$null,$null);$this.Drive.Forces($null,$(if($left){-1}else{1}),$null,$null,$null,$null,$null)}
+            else{$this.Drive.Set(1,$(if($left){1}else{-1}),$null)}
+            $this.Status.Set($(if($left){'dodge:left'}else{'dodge:right'}),$this.Dodges)
         }
         if($this.Battery.Charge -lt $this.Battery.Capacity/4){$this.Drive.Set($this.Drive.Get('throttle')*0.5,$null,$null)}
         $storm=$this.Nav.Storm;$zone=$this.Nav.Zone

@@ -1,5 +1,10 @@
 # A robot on the arena's shared .NET core binding.
 # The SDK launcher loads Clunkyard.dll before this file is parsed.
+# Bearing is earned: a scan contact's bearing is off by up to its
+# BearingError (degrees, a fixed share of the arc), so a wide beam finds a
+# robot and a narrow one aims at it. This robot narrows the beam on its target
+# and shoots along a line fitted through its recent sightings. Contacts within
+# 120 units are exact.
 # Clunkyard robot API 2.0.0: one core under every language, the same
 # answers everywhere. Facts (a call shows its arguments):
 # match: mode ruleset control robots is_3d tick_rate max_ticks
@@ -46,40 +51,95 @@
 using namespace Clunkyard
 
 class Starter : Clunkyard.Robot {
+    static [double] $SearchArc=40   # degrees: sweeps the circle in half a second
+    static [double] $HoldWidth=60   # units across at the target: it stays in the beam from tick to tick
+    static [double] $MinArc=6       # degrees: the narrowest the beam holds
+    static [int] $Window=12         # ticks of sightings the aim averages
+    static [int] $Sightings=8       # narrow sightings in the window before a shot
+    static [int] $LookEvery=40      # ticks between looks around the target, for a nearer robot
+    static [int] $Reacquire=10      # ticks to look again where a lost target was
     [bool] $Free
     [int] $Dodges
     [int] $DodgeEnd
+    [int] $Slot
     [double] Steer([double]$towards,[double]$current){return $this.Angles.Clamp($this.Angles.AngleDiff($towards,$current)/45)}
     [void] OnStart(){$this.Free=$this.Match.Is3d -and $this.Arena.Gravity.Z -eq 0}
+    # A straight line through the narrowest of the last Window ticks' sightings:
+    # where the robot is now, how fast it moves, and how many sightings it rests
+    # on. Each sighting is off by its BearingError; the line averages that out.
+    [object] Fit([int]$slot,[int]$tick){
+        $recent=[System.Collections.Generic.List[object]]::new();$best=[double]::MaxValue
+        foreach($s in $this.Tracker.History($slot)){
+            if($s.Tick -gt $tick-[Starter]::Window){$recent.Add($s);if($s.BearingError -lt $best){$best=$s.BearingError}}
+        }
+        if($recent.Count -lt 2){return $null}
+        $seen=[System.Collections.Generic.List[object]]::new()
+        foreach($s in $recent){if($s.BearingError -le 1.5*$best){$seen.Add($s)}}
+        $n=$seen.Count
+        if($n -lt 2){return $null}
+        $t0=0.0;foreach($s in $seen){$t0+=$s.Tick/$n}
+        $spread=0.0;foreach($s in $seen){$spread+=($s.Tick-$t0)*($s.Tick-$t0)}
+        $position=@(0.0,0.0,0.0);$velocity=@(0.0,0.0,0.0)
+        for($axis=0;$axis -lt 3;$axis++){
+            $mean=0.0;$slope=0.0
+            foreach($s in $seen){$mean+=@($s.Position.X,$s.Position.Y,$s.Position.Z)[$axis]/$n}
+            foreach($s in $seen){$slope+=($s.Tick-$t0)*(@($s.Position.X,$s.Position.Y,$s.Position.Z)[$axis]-$mean)}
+            $slope/=$spread
+            $position[$axis]=$mean+$slope*($tick-$t0);$velocity[$axis]=$slope*$this.Match.TickRate
+        }
+        return @{Position=[Clunkyard.Vec3]::new($position[0],$position[1],$position[2]);Velocity=[Clunkyard.Vec3]::new($velocity[0],$velocity[1],$velocity[2]);Count=$n}
+    }
     [void] OnTurn(){
-        $me=$this.Me;$position=$me.Position;$gun=$this.Gun;$scanner=$this.Scanner
+        $me=$this.Me;$position=$me.Position;$gun=$this.Gun;$scanner=$this.Scanner;$tick=$this.Clock.Tick
         $this.Drive.Forces($null,$null,$null,$null,$null,$null,0.2)
         $target=$this.Sensors.Nearest;$cue=$this.Tracker.Cue
+        $lastSeen=if($this.Slot -ne 0){$this.Tracker.LastSeen($this.Slot)}else{$null}
         if($null -ne $target){
+            $this.Slot=$target.Slot
             $throttle=if($target.Range -gt 350){0.7}elseif($target.Range -lt 200){-0.4}else{0.2}
             $this.Drive.Set($throttle,$this.Steer($target.Bearing,$me.Heading),$this.Steer($target.Elevation,$me.Pitch))
-            $scanner.Set($target.Bearing,20,$target.Elevation)
-            # Gun.Lead is the intercept if the target holds course.
-            $power=$gun.PowerForFlightTime($target.Range,1);$aim=$gun.Lead($target,$power)
+            # Halve the beam each tick until it is HoldWidth across at the target:
+            # narrow enough for a precise bearing, wide enough to keep it in.
+            $hold=[Math]::Max([Starter]::MinArc,2*[Math]::Atan2([Starter]::HoldWidth/2,$target.Range)*180/[Math]::PI)
+            # In a crowd a narrow beam sees one robot. Every LookEvery ticks,
+            # widen it for a tick: a nearer robot it finds becomes the target.
+            $arc=if($tick%[Starter]::LookEvery -eq 0){[Starter]::SearchArc}else{[Math]::Max($hold,[Math]::Min([Starter]::SearchArc,$scanner.Last.Arc/2))}
+            $scanner.Set($target.Bearing,$arc,$target.Elevation)
+            $power=$gun.PowerForFlightTime($target.Range,1)
+            # An exact contact: Gun.Lead is the intercept if the target holds
+            # course. A noisy one: lead the fitted line, and fire only once it
+            # rests on enough sightings.
+            $ready=$true;$aim=$null
+            if($target.BearingError -gt 0){
+                $fit=$this.Fit($target.Slot,$tick)
+                if($null -ne $fit){$aim=$gun.LeadPoint($fit.Position,$fit.Velocity,$power)}
+                $ready=($null -ne $fit) -and ($fit.Count -ge [Starter]::Sightings)
+            }else{$aim=$gun.Lead($target,$power)}
             $heading=if($null -ne $aim){$aim.Heading}else{$target.Bearing}
             $pitch=if($null -ne $aim){$aim.Pitch}else{$target.Elevation}
             $gun.Aim($heading,$pitch);$now=$gun.AimNow
-            if([Math]::Abs($this.Angles.AngleDiff($heading,$now.Heading)) -lt 3 -and [Math]::Abs($pitch-$now.Pitch) -lt 3 -and $gun.CanFire($power,10)){$gun.Fire($power)}
-            $this.Status.Set('TRACK',$target.Range)
+            if($ready -and [Math]::Abs($this.Angles.AngleDiff($heading,$now.Heading)) -lt 3 -and [Math]::Abs($pitch-$now.Pitch) -lt 3 -and $gun.CanFire($power,10)){$gun.Fire($power)}
+            $this.Status.Set($(if($ready){'TRACK'}else{'NARROW'}),$target.Range)
+        }elseif($null -ne $lastSeen -and $tick-$lastSeen -le [Starter]::Reacquire){
+            # Lost it: look again where it was last seen, widening the beam, before searching.
+            $where=$this.Tracker.Position($this.Slot)
+            $bearing=$this.Angles.BearingTo($position,$where);$elevation=if($this.Free){$this.Angles.ElevationTo($position,$where)}else{0}
+            $this.Drive.Set(0.5,$this.Steer($bearing,$me.Heading),$this.Steer($elevation,$me.Pitch))
+            $scanner.Set($bearing,[Math]::Min([Starter]::SearchArc,$scanner.Last.Arc*2),$elevation);$this.Status.Set('REACQUIRE',$null)
         }elseif($null -ne $cue){
             $bearing=$this.Angles.BearingTo($position,$cue.Position);$distance=$this.Angles.Distance($position,$cue.Position)
             $elevation=if($this.Free){$this.Angles.ElevationTo($position,$cue.Position)}else{0}
-            $error=[Math]::Min($cue.BearingError,30);$tick=$this.Clock.Tick
+            $error=[Math]::Min($cue.BearingError,30)
             $across=($tick%5-2)/2.0*$error;$up=if($this.Free){([Math]::Floor($tick/5)%3-1)*$error/2}else{0}
             $this.Drive.Set(0.7,$this.Steer($bearing,$me.Heading),$this.Steer($elevation,$me.Pitch))
             $scanner.Set($bearing+$across,$scanner.ArcForReach($distance+100),$elevation+$up);$this.Status.Set('CUE',$distance)
         }else{
             $this.Drive.Set(0.5,0.33,$this.Steer(0,$me.Pitch))
-            $pitch=if($this.Free){([Math]::Floor($this.Clock.Tick/10)%3-1)*35}else{0}
-            $scanner.Set($this.Angles.Normalize($scanner.Last.Heading+36),40,$pitch);$this.Status.Set('SEARCH',$null)
+            $pitch=if($this.Free){([Math]::Floor($tick/10)%3-1)*35}else{0}
+            $scanner.Set($this.Angles.Normalize($scanner.Last.Heading+36),[Starter]::SearchArc,$pitch);$this.Status.Set('SEARCH',$null)
         }
         # A simple dodge: vary it, or predict the shooter.
-        $tick=$this.Clock.Tick;$heard=$false
+        $heard=$false
         foreach($c in $this.Sensors.Cues){if($c.Source -eq [Clunkyard.Source]::Muzzle){$heard=$true}}
         if($tick -ge $this.DodgeEnd -and $heard){$this.Dodges++;$this.DodgeEnd=$tick+10}
         if($tick -lt $this.DodgeEnd){
